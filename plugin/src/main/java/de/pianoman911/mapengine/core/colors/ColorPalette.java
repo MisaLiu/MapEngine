@@ -279,8 +279,7 @@ public class ColorPalette implements IMapColors {
     @SuppressWarnings("deprecation") // magic value
     private boolean checkValidity() {
         boolean valid = true;
-        for (int i = 0; i < 256; i++) {
-            byte color = (byte) i;
+        for (byte color : this.available) {
             int engine = this.toRGB(color);
             int bukkit = MapPalette.getColor(color).getRGB();
 

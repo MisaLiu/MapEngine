@@ -25,8 +25,14 @@ public class HoldableDisplayOutput extends BaseDisplayOutput {
         MapItem display = (MapItem) ctx.getDisplay();
 
         if (!ctx.buffering()) {
-            ColorBuffer previous = this.convert(ctx.previousBuffer(), ctx, MAP_COUNT);
-            MapUpdateData data = MapUpdateData.createMapUpdateData(buffer.data(), previous.data(), 0);
+            FullSpacedColorBuffer previousBuffer = ctx.previousBuffer();
+            MapUpdateData data;
+            if (previousBuffer == null) {
+                data = MapUpdateData.createMapUpdateData(buffer.data(), null, 0);
+            } else {
+                ColorBuffer previous = this.convert(previousBuffer, ctx, MAP_COUNT);
+                data = MapUpdateData.createMapUpdateData(buffer.data(), previous.data(), 0);
+            }
 
             for (Player receiver : ctx.receivers()) {
                 display.update(receiver, data, ctx.z(), ctx.cursors());

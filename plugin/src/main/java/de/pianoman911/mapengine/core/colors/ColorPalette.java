@@ -136,7 +136,7 @@ public class ColorPalette implements IMapColors {
                             int index = this.dataIndex(finalRed, finalGreen, blue);
 
                             this.colors[index] = color;
-                            this.reverseColors[index] = index;
+                            this.reverseColors[index] = MapPalette.getColor(color).getRGB();
                             usedColors.add(color);
                         }
                         return null;

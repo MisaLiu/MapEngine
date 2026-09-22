@@ -22,7 +22,6 @@ import java.io.IOException;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
@@ -128,32 +127,23 @@ public class ColorPalette implements IMapColors {
             long start = System.currentTimeMillis();
             long last = start;
 
-            // must be thread-safe: 256 tasks per red value add to it concurrently
-            Set<Byte> usedColors = ConcurrentHashMap.newKeySet();
+            Set<Byte> usedColors = new HashSet<>();
             for (int red = 0; red < 256; red++) {
-                CompletableFuture<?>[] futures = new CompletableFuture[256];
                 for (int green = 0; green < 256; green++) {
-                    int finalRed = red, finalGreen = green;
-                    futures[green] = CompletableFuture.supplyAsync(() -> {
-                        for (int blue = 0; blue < 256; blue++) {
-                            byte color = MapPalette.matchColor(finalRed, finalGreen, blue);
-                            int index = this.dataIndex(finalRed, finalGreen, blue);
+                    for (int blue = 0; blue < 256; blue++) {
+                        byte color = MapPalette.matchColor(red, green, blue);
+                        int index = this.dataIndex(red, green, blue);
 
-                            colors[index] = color;
-                            reverseColors[index] = MapPalette.getColor(color).getRGB();
-                            usedColors.add(color);
-                        }
-                        return null;
-                    });
+                        colors[index] = color;
+                        reverseColors[index] = MapPalette.getColor(color).getRGB();
+                        usedColors.add(color);
+                    }
                 }
 
                 if (last + 250 < System.currentTimeMillis() || red == 255) {
-                    this.plugin.getLogger().info("Generating palette... " + String.format("%.2f", (red * 100 / 255.0))
-                            + "% - Working threads: " + futures.length);
+                    this.plugin.getLogger().info("Generating palette... " + String.format("%.2f", (red * 100 / 255.0)) + "%");
                     last = System.currentTimeMillis();
                 }
-
-                CompletableFuture.allOf(futures).join();
             }
 
             byte[] available = new byte[usedColors.size()];
@@ -279,7 +269,7 @@ public class ColorPalette implements IMapColors {
 
     public final int closestColor(final int rgb) {
         final int alpha = (rgb >> 24) & 0xFF;
-        if (alpha == 0) {
+        if (alpha < 128) {
             return 0;
         }
         final int ret = this.reverseColors[rgb & 0xFFFFFF];
@@ -289,7 +279,8 @@ public class ColorPalette implements IMapColors {
     @SuppressWarnings("deprecation") // magic value
     private boolean checkValidity() {
         boolean valid = true;
-        for (byte color : this.available) {
+        for (int i = 0; i < 256; i++) {
+            byte color = (byte) i;
             int engine = this.toRGB(color);
             int bukkit = MapPalette.getColor(color).getRGB();
 

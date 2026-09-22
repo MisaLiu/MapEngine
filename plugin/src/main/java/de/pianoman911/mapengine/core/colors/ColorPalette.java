@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
@@ -120,12 +121,15 @@ public class ColorPalette implements IMapColors {
         Bukkit.getScheduler().runTaskAsynchronously(this.plugin, () -> {
             this.plugin.getLogger().info("Generating palette...");
 
-            this.colors = new byte[256 * 256 * 256];
-            this.reverseColors = new int[256 * 256 * 256];
+            // build into locals and publish only once complete, so a concurrent
+            // render can never observe a half-filled palette
+            byte[] colors = new byte[256 * 256 * 256];
+            int[] reverseColors = new int[256 * 256 * 256];
             long start = System.currentTimeMillis();
             long last = start;
 
-            Set<Byte> usedColors = new HashSet<>();
+            // must be thread-safe: 256 tasks per red value add to it concurrently
+            Set<Byte> usedColors = ConcurrentHashMap.newKeySet();
             for (int red = 0; red < 256; red++) {
                 CompletableFuture<?>[] futures = new CompletableFuture[256];
                 for (int green = 0; green < 256; green++) {
@@ -135,8 +139,8 @@ public class ColorPalette implements IMapColors {
                             byte color = MapPalette.matchColor(finalRed, finalGreen, blue);
                             int index = this.dataIndex(finalRed, finalGreen, blue);
 
-                            this.colors[index] = color;
-                            this.reverseColors[index] = MapPalette.getColor(color).getRGB();
+                            colors[index] = color;
+                            reverseColors[index] = MapPalette.getColor(color).getRGB();
                             usedColors.add(color);
                         }
                         return null;
@@ -152,20 +156,39 @@ public class ColorPalette implements IMapColors {
                 CompletableFuture.allOf(futures).join();
             }
 
-            this.available = new byte[usedColors.size()];
-            this.rgb = new int[255];
+            byte[] available = new byte[usedColors.size()];
+            int[] rgb = new int[256];
 
             int i = 0;
-            for (Byte color : usedColors) {
-                this.available[i++] = color;
-                this.rgb[color >= 0 ? color : color + 256] = MapPalette.getColor(color).getRGB();
+            for (byte color : usedColors) {
+                available[i++] = color;
+                rgb[color >= 0 ? color : color + 256] = MapPalette.getColor(color).getRGB();
             }
+
+            this.colors = colors;
+            this.reverseColors = reverseColors;
+            this.available = available;
+            this.rgb = rgb;
 
             this.plugin.getLogger().info("Palette generated! Took " + (System.currentTimeMillis() - start) + "ms");
             this.save();
-            this.loadFuture.complete(this);
 
-            this.checkRetry();
+            if (this.checkValidity()) {
+                this.plugin.getLogger().info("Color palette is valid!" + (this.retries > 0 ? " (Retried " + this.retries + " times)" : ""));
+                this.loadFuture.complete(this);
+                return;
+            }
+
+            this.plugin.getLogger().warning("Color palette is invalid!" + (this.retries > 0 ? " (Retried " + this.retries + " times)" : ""));
+            if (this.retries < 10) {
+                this.retries++;
+                this.plugin.getLogger().warning("Retrying... (" + this.retries + "/10)");
+                this.generateColors();
+            } else {
+                this.plugin.getLogger().warning("Failed to load color palette!");
+                this.loadFuture.completeExceptionally(new IllegalStateException("Failed to generate color palette"));
+                Bukkit.getPluginManager().disablePlugin(this.plugin);
+            }
         });
     }
 
@@ -214,7 +237,7 @@ public class ColorPalette implements IMapColors {
                 }
 
                 this.available = new byte[usedColors.size()];
-                this.rgb = new int[255];
+                this.rgb = new int[256];
 
                 int i = 0;
                 for (Byte color : usedColors) {
@@ -263,40 +286,17 @@ public class ColorPalette implements IMapColors {
         return (ret & 0xFFFFFF) | (alpha << 24);
     }
 
-    private void checkRetry() {
-        this.loadFuture.thenAccept($ -> {
-            boolean valid = checkValidity();
-            if (valid) {
-                this.plugin.getLogger().info("Color palette is valid!" + (this.retries > 0 ? " (Retried " + this.retries + " times)" : ""));
-                return;
-            }
-
-            this.plugin.getLogger().warning("Color palette is invalid!" + (this.retries > 0 ? " (Retried " + this.retries + " times)" : ""));
-            if (this.retries < 10) {
-                this.retries++;
-                this.plugin.getLogger().warning("Retrying... (" + this.retries + "/10)");
-                this.generateColors();
-            } else {
-                this.plugin.getLogger().warning("Failed to load color palette!");
-                Bukkit.getPluginManager().disablePlugin(this.plugin);
-            }
-        });
-    }
-
     @SuppressWarnings("deprecation") // magic value
     private boolean checkValidity() {
         boolean valid = true;
-        try {
-            for (byte i = -128; i < 127; i++) {
-                int engine = this.toRGB(i);
-                int bukkit = MapPalette.getColor(i).getRGB();
+        for (byte color : this.available) {
+            int engine = this.toRGB(color);
+            int bukkit = MapPalette.getColor(color).getRGB();
 
-                if (engine != bukkit) {
-                    this.plugin.getLogger().warning("Color " + i + " is invalid! MapEngine: " + engine + " Bukkit: " + bukkit);
-                    valid = false;
-                }
+            if (engine != bukkit) {
+                this.plugin.getLogger().warning("Color " + color + " is invalid! MapEngine: " + engine + " Bukkit: " + bukkit);
+                valid = false;
             }
-        } catch (Throwable ignored) {
         }
         return valid;
     }

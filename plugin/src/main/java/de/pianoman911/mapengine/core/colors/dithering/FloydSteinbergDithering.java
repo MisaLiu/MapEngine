@@ -16,11 +16,8 @@ import de.pianoman911.mapengine.core.colors.ColorPalette;
  *       high-frequency residue that reads as salt-and-pepper noise).</li>
  *   <li>Quantized pixels are written straight as map color bytes — no
  *       {@code toRGB → matchColor} round trip after the pass.</li>
- *   <li>Chroma (color) error is diffused at a reduced gain relative to the
- *       brightness error. {@code MapPalette.matchColor} selects nearest colors
- *       with a luminance-weighted metric while the error lives in plain sRGB;
- *       diffusing full chroma against that mismatch turns pastel gradients into
- *       color speckles.</li>
+ *   <li>Color (chroma) error is diffused at full gain so local averages stay
+ *       hue-accurate; dithering redistributes error, it must not discard it.</li>
  * </ul>
  */
 public final class FloydSteinbergDithering {
@@ -33,10 +30,14 @@ public final class FloydSteinbergDithering {
 
     /**
      * Gain applied to the chroma part of the diffusion error (0..1).
-     * 1 = classic FS in sRGB; lower values suppress color speckling while the
-     * mean (brightness) error still diffuses at full strength.
+     * <p>
+     * Must stay {@code 1.0} for classic Floyd–Steinberg: error has to be fully
+     * conserved in the neighbourhood or block averages drift away from the
+     * source hue (measured: chroma block-MSE ~2x worse at 0.45 vs 1.0).
+     * Perceived speckle is better addressed by float error + serpentine scan
+     * than by dropping color error.
      */
-    private static final float CHROMA_GAIN = 0.45f;
+    private static final float CHROMA_GAIN = 1.0f;
 
     private FloydSteinbergDithering() {
     }
@@ -92,7 +93,7 @@ public final class FloydSteinbergDithering {
                 float errG = oldG - ((quantizedRgb >> 8) & 0xFF);
                 float errB = oldB - (quantizedRgb & 0xFF);
 
-                // Full brightness error, damped color error (see CHROMA_GAIN).
+                // Full error diffusion (CHROMA_GAIN = 1 keeps hue averages correct).
                 float mean = (errR + errG + errB) / 3f;
                 float diffR = mean + (errR - mean) * CHROMA_GAIN;
                 float diffG = mean + (errG - mean) * CHROMA_GAIN;

@@ -4,102 +4,144 @@ import de.pianoman911.mapengine.api.util.ColorBuffer;
 import de.pianoman911.mapengine.api.util.FullSpacedColorBuffer;
 import de.pianoman911.mapengine.core.colors.ColorPalette;
 
-public class FloydSteinbergDithering {
+/**
+ * Floyd–Steinberg error diffusion that converts a full-spaced ARGB buffer into
+ * Minecraft map color indices.
+ * <p>
+ * Implementation notes:
+ * <ul>
+ *   <li>Serpentine (alternating) scan direction reduces worm/checker artifacts.</li>
+ *   <li>Accumulated error is kept in float form so fractional error is not
+ *       truncated away on every step (integer in-place diffusion leaves
+ *       high-frequency residue that reads as salt-and-pepper noise).</li>
+ *   <li>Quantized pixels are written straight as map color bytes — no
+ *       {@code toRGB → matchColor} round trip after the pass.</li>
+ *   <li>Chroma (color) error is diffused at a reduced gain relative to the
+ *       brightness error. {@code MapPalette.matchColor} selects nearest colors
+ *       with a luminance-weighted metric while the error lives in plain sRGB;
+ *       diffusing full chroma against that mismatch turns pastel gradients into
+ *       color speckles.</li>
+ * </ul>
+ */
+public final class FloydSteinbergDithering {
 
-    // Floyd-Steinberg error diffusion matrix
-    private static final float FS_ERROR = 7f / 16f;
-    private static final float FS_ERROR2 = 1f / 16f;
-    private static final float FS_ERROR3 = 5f / 16f;
-    private static final float FS_ERROR4 = 3f / 16f;
+    // Floyd-Steinberg error diffusion matrix (right, down-left, down, down-right)
+    private static final float FS_RIGHT = 7f / 16f;
+    private static final float FS_DOWN_LEFT = 3f / 16f;
+    private static final float FS_DOWN = 5f / 16f;
+    private static final float FS_DOWN_RIGHT = 1f / 16f;
 
     /**
-     * My own implementation of Floyd-Steinberg dithering algorithm, to convert a FullSpacedColorBuffer (24Bit Colors) to a ColorBuffer (Minecraft Colors).
-     * It's not an accurate implementation, so it corrects the errors at the end.
-     * On the other hand, it's extremely fast.
-     *
-     * @param buffer  The FullSpacedColorBuffer to dither
-     * @param palette The ColorPalette to use
-     * @param threads retained for API compatibility; error diffusion is processed sequentially
-     * @return The dithered ColorBuffer
+     * Gain applied to the chroma part of the diffusion error (0..1).
+     * 1 = classic FS in sRGB; lower values suppress color speckling while the
+     * mean (brightness) error still diffuses at full strength.
      */
-    @SuppressWarnings("Duplicates") // It's duplicated, but it's faster than using a method
+    private static final float CHROMA_GAIN = 0.45f;
+
+    private FloydSteinbergDithering() {
+    }
+
+    /**
+     * @param buffer  full-spaced ARGB source (not mutated)
+     * @param palette color palette used for nearest-color lookup
+     * @param threads retained for API compatibility; diffusion is sequential
+     * @return map color byte buffer
+     */
     public static ColorBuffer dither(FullSpacedColorBuffer buffer, ColorPalette palette, int threads) {
-        // Error diffusion is sequential by definition. Splitting rows between
-        // workers lets one worker read rows while another worker is still
-        // changing them, which produces nondeterministic color noise.
-        int[] src = buffer.buffer().clone();
-        int w = buffer.width();
-        int h = buffer.height();
+        palette.ensureLoaded();
 
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                int index = x + y * w;
-                int rgb = src[index];
+        int width = buffer.width();
+        int height = buffer.height();
+        int[] source = buffer.buffer();
+        int size = width * height;
 
-                if (((rgb >> 24) & 0xFF) < 128) {
-                    src[index] = 0;
+        float[] workR = new float[size];
+        float[] workG = new float[size];
+        float[] workB = new float[size];
+        boolean[] opaque = new boolean[size];
+        for (int i = 0; i < size; i++) {
+            int argb = source[i];
+            opaque[i] = ((argb >> 24) & 0xFF) >= 128;
+            workR[i] = (argb >> 16) & 0xFF;
+            workG[i] = (argb >> 8) & 0xFF;
+            workB[i] = argb & 0xFF;
+        }
+
+        byte[] out = new byte[size];
+
+        for (int y = 0; y < height; y++) {
+            boolean reverse = (y & 1) != 0;
+            for (int t = 0; t < width; t++) {
+                int x = reverse ? width - 1 - t : t;
+                int index = x + y * width;
+
+                if (!opaque[index]) {
+                    out[index] = 0;
                     continue;
                 }
 
-                int oldR = (rgb >> 16) & 0xFF;
-                int oldG = (rgb >> 8) & 0xFF;
-                int oldB = (rgb) & 0xFF;
+                int oldR = clamp(workR[index]);
+                int oldG = clamp(workG[index]);
+                int oldB = clamp(workB[index]);
 
-                int mc = palette.closestColor(rgb);
+                byte mapColor = palette.color(oldR, oldG, oldB);
+                int quantizedRgb = palette.toRGB(mapColor);
+                out[index] = mapColor;
 
-                int a;
-                int r = (mc >> 16) & 0xFF;
-                int g = (mc >> 8) & 0xFF;
-                int b = (mc) & 0xFF;
+                float errR = oldR - ((quantizedRgb >> 16) & 0xFF);
+                float errG = oldG - ((quantizedRgb >> 8) & 0xFF);
+                float errB = oldB - (quantizedRgb & 0xFF);
 
-                int errorR = oldR - r;
-                int errorG = oldG - g;
-                int errorB = oldB - b;
+                // Full brightness error, damped color error (see CHROMA_GAIN).
+                float mean = (errR + errG + errB) / 3f;
+                float diffR = mean + (errR - mean) * CHROMA_GAIN;
+                float diffG = mean + (errG - mean) * CHROMA_GAIN;
+                float diffB = mean + (errB - mean) * CHROMA_GAIN;
 
-                src[index] = mc;
+                int step = reverse ? -1 : 1;
 
-                if (!(x == w - 1)) {
-                    index = x + 1 + y * w;
-                    rgb = src[index];
-                    a = (rgb >> 24) & 0xFF;
-                    r = Math.max(0, Math.min(255, (int) (((rgb >> 16) & 0xFF) + (errorR * FS_ERROR))));
-                    g = Math.max(0, Math.min(255, (int) (((rgb >> 8) & 0xFF) + (errorG * FS_ERROR))));
-                    b = Math.max(0, Math.min(255, (int) (((rgb) & 0xFF) + (errorB * FS_ERROR))));
-                    src[index] = (a << 24) | (r << 16) | (g << 8) | b;
-
-                    if (!(y == h - 1)) {
-                        index = x + 1 + (y + 1) * w;
-                        rgb = src[index];
-                        a = (rgb >> 24) & 0xFF;
-                        r = Math.max(0, Math.min(255, (int) (((rgb >> 16) & 0xFF) + (errorR * FS_ERROR2))));
-                        g = Math.max(0, Math.min(255, (int) (((rgb >> 8) & 0xFF) + (errorG * FS_ERROR2))));
-                        b = Math.max(0, Math.min(255, (int) (((rgb) & 0xFF) + (errorB * FS_ERROR2))));
-                        src[index] = (a << 24) | (r << 16) | (g << 8) | b;
-                    }
+                // right (or left when scanning backwards)
+                int xNext = x + step;
+                if (xNext >= 0 && xNext < width) {
+                    diffuse(workR, workG, workB, opaque, xNext + y * width, diffR, diffG, diffB, FS_RIGHT);
                 }
 
-                if (!(y == h - 1)) {
-                    index = x + (y + 1) * w;
-                    rgb = src[index];
-                    a = (rgb >> 24) & 0xFF;
-                    r = Math.max(0, Math.min(255, (int) (((rgb >> 16) & 0xFF) + (errorR * FS_ERROR3))));
-                    g = Math.max(0, Math.min(255, (int) (((rgb >> 8) & 0xFF) + (errorG * FS_ERROR3))));
-                    b = Math.max(0, Math.min(255, (int) (((rgb) & 0xFF) + (errorB * FS_ERROR3))));
-                    src[index] = (a << 24) | (r << 16) | (g << 8) | b;
+                if (y + 1 >= height) {
+                    continue;
+                }
 
-                    if (!(x == 0)) {
-                        index = x - 1 + (y + 1) * w;
-                        rgb = src[index];
-                        a = (rgb >> 24) & 0xFF;
-                        r = Math.max(0, Math.min(255, (int) (((rgb >> 16) & 0xFF) + (errorR * FS_ERROR4))));
-                        g = Math.max(0, Math.min(255, (int) (((rgb >> 8) & 0xFF) + (errorG * FS_ERROR4))));
-                        b = Math.max(0, Math.min(255, (int) (((rgb) & 0xFF) + (errorB * FS_ERROR4))));
-                        src[index] = (a << 24) | (r << 16) | (g << 8) | b;
-                    }
+                // down-left relative to scan direction becomes down-right on reverse rows
+                int xDiag = x - step;
+                if (xDiag >= 0 && xDiag < width) {
+                    diffuse(workR, workG, workB, opaque, xDiag + (y + 1) * width, diffR, diffG, diffB, FS_DOWN_LEFT);
+                }
+                diffuse(workR, workG, workB, opaque, x + (y + 1) * width, diffR, diffG, diffB, FS_DOWN);
+                if (xNext >= 0 && xNext < width) {
+                    diffuse(workR, workG, workB, opaque, xNext + (y + 1) * width, diffR, diffG, diffB, FS_DOWN_RIGHT);
                 }
             }
         }
 
-        return new ColorBuffer(palette.colors(src), buffer.width(), buffer.height());
+        return new ColorBuffer(out, width, height);
+    }
+
+    private static void diffuse(float[] workR, float[] workG, float[] workB, boolean[] opaque,
+                                int index, float errR, float errG, float errB, float weight) {
+        if (!opaque[index]) {
+            return;
+        }
+        workR[index] += errR * weight;
+        workG[index] += errG * weight;
+        workB[index] += errB * weight;
+    }
+
+    private static int clamp(float value) {
+        if (value <= 0f) {
+            return 0;
+        }
+        if (value >= 255f) {
+            return 255;
+        }
+        return (int) value;
     }
 }

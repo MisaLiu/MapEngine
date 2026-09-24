@@ -42,6 +42,17 @@ public class ColorPalette implements IMapColors {
         this.load();
     }
 
+    /**
+     * Blocks until the palette tables are fully published (loaded from disk or
+     * regenerated). Safe to call from any thread that is not the generator
+     * task itself; no-ops when already complete.
+     */
+    public void ensureLoaded() {
+        if (!this.loadFuture.isDone()) {
+            this.loadFuture.join();
+        }
+    }
+
     @Override
     public final byte color(Color color) {
         return this.color(color.getRGB());
@@ -52,10 +63,12 @@ public class ColorPalette implements IMapColors {
         if (((rgb >> 24) & 0xFF) < 128) {
             return 0;
         }
+        this.ensureLoaded();
         return this.colors[rgb & 0xFFFFFF];
     }
 
     public byte[] colors(int[] rgb, int threads) {
+        this.ensureLoaded();
         byte[] result = new byte[rgb.length];
         CompletableFuture<?>[] futures = new CompletableFuture[threads];
         int size = rgb.length / threads;
@@ -85,6 +98,7 @@ public class ColorPalette implements IMapColors {
 
     @Override
     public FullSpacedColorBuffer adjustColors(FullSpacedColorBuffer buffer, Converter converter) {
+        this.ensureLoaded();
         return switch (converter) {
             case DIRECT -> {
                 ColorBuffer mc = this.convertDirect(buffer);
@@ -104,6 +118,7 @@ public class ColorPalette implements IMapColors {
 
     @Override
     public final byte color(int r, int g, int b) {
+        this.ensureLoaded();
         return this.colors[this.dataIndex(r, g, b)];
     }
 
@@ -255,11 +270,13 @@ public class ColorPalette implements IMapColors {
 
     @Override
     public final int toRGB(byte color) {
+        this.ensureLoaded();
         return this.rgb[color >= 0 ? color : color + 256];
     }
 
     @Override
     public final int[] toRGBs(byte[] colors) {
+        this.ensureLoaded();
         int[] rgb = new int[colors.length];
         for (int i = 0; i < colors.length; i++) {
             rgb[i] = this.toRGB(colors[i]);
@@ -272,19 +289,44 @@ public class ColorPalette implements IMapColors {
         if (alpha < 128) {
             return 0;
         }
+        this.ensureLoaded();
         final int ret = this.reverseColors[rgb & 0xFFFFFF];
         return (ret & 0xFFFFFF) | (alpha << 24);
     }
 
+    /**
+     * Validates that the on-disk / in-memory tables agree with Bukkit and that
+     * the forward lookup is consistent with the reverse mapping.
+     * <p>
+     * Previously this only compared {@code toRGB} against {@code getColor},
+     * which is tautological because both are filled from the same call. It now
+     * also checks {@code matchColor(getColor(b)) == b} and that the 16M forward
+     * table maps each palette RGB back to the same byte.
+     */
     @SuppressWarnings("deprecation") // magic value
     private boolean checkValidity() {
         boolean valid = true;
         for (byte color : this.available) {
-            int engine = this.toRGB(color);
-            int bukkit = MapPalette.getColor(color).getRGB();
+            int engine = this.rgb[color >= 0 ? color : color + 256];
+            Color bukkitColor = MapPalette.getColor(color);
+            int bukkit = bukkitColor.getRGB();
 
             if (engine != bukkit) {
                 this.plugin.getLogger().warning("Color " + color + " is invalid! MapEngine: " + engine + " Bukkit: " + bukkit);
+                valid = false;
+                continue;
+            }
+
+            byte roundTrip = MapPalette.matchColor(bukkitColor);
+            if (roundTrip != color) {
+                this.plugin.getLogger().warning("Color " + color + " does not round-trip matchColor, got " + roundTrip);
+                valid = false;
+            }
+
+            // forward table at the palette RGB must return the same byte
+            if (this.colors[bukkit & 0xFFFFFF] != color) {
+                this.plugin.getLogger().warning("Forward table mismatch for color " + color
+                        + ": colors[paletteRgb]=" + this.colors[bukkit & 0xFFFFFF]);
                 valid = false;
             }
         }
